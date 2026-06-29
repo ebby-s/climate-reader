@@ -2,16 +2,28 @@
 #include <DHT.h>
 #include <WiFi.h>
 #include <esp_wpa2.h>
+#include <esp_wifi.h>
+#include <esp_system.h>
 #include <HTTPClient.h>
+#include <Adafruit_NeoPixel.h>
+#include <Preferences.h>
 #include "secrets.h"
 
-#define DHT_PIN 2
-#define DHT_TYPE DHT11
+#define DHT_PIN     2
+#define DHT_TYPE    DHT11
+
+#define LED_PIN     8
+#define LED_COUNT   1
+#define LED_BRIGHT  10
 
 DHT dht(DHT_PIN, DHT_TYPE);
+Adafruit_NeoPixel rgbLed(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-const char* wifiStatusToString(wl_status_t status) {
-  switch (status) {
+static const uint32_t WIFI_RETRY_INTERVAL = 15000;
+static const uint32_t UPLOAD_INTERVAL     = 60000;
+
+const char* wifiStatusStr(wl_status_t s) {
+  switch (s) {
     case WL_IDLE_STATUS:     return "WL_IDLE_STATUS";
     case WL_NO_SSID_AVAIL:   return "WL_NO_SSID_AVAIL";
     case WL_SCAN_COMPLETED:  return "WL_SCAN_COMPLETED";
@@ -23,66 +35,60 @@ const char* wifiStatusToString(wl_status_t status) {
   }
 }
 
-static bool wifiInitDone = false;
-static bool wasEverConnected = false;
+void ledOff() {
+  rgbLed.clear();
+  rgbLed.show();
+}
 
-void connectWiFi() {
-  if (!wifiInitDone) {
-    Serial.print("Connecting to ");
-    Serial.println(WIFI_SSID);
+void ledFlash(uint8_t r, uint8_t g, uint8_t b, int ms) {
+  rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
+  rgbLed.show();
+  delay(ms);
+  ledOff();
+}
 
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(true);
-    delay(200);
+bool connectWiFi() {
+  Serial.print("Connecting to "); Serial.println(WIFI_SSID);
 
-    esp_wifi_sta_wpa2_ent_set_disable_time_check(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(200);
 
-    WiFi.begin(WIFI_SSID, WPA2_AUTH_PEAP, EAP_IDENTITY, EAP_USERNAME, EAP_PASSWORD);
-    wifiInitDone = true;
-  } else if (wasEverConnected) {
-    Serial.println("Reconnecting WiFi...");
-    WiFi.reconnect();
-  }
+  esp_wifi_sta_wpa2_ent_set_disable_time_check(true);
+  WiFi.begin(WIFI_SSID, WPA2_AUTH_PEAP,
+             EAP_IDENTITY, EAP_USERNAME, EAP_PASSWORD);
 
   Serial.print("Waiting");
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 180) {
+  int a = 0;
+  while (WiFi.status() != WL_CONNECTED && a < 180) {
     delay(500);
-    if (attempts % 10 == 0) Serial.print(".");
-    if (attempts > 0 && attempts % 40 == 0) {
-      Serial.print("(");
-      Serial.print(attempts / 2);
-      Serial.print("s)");
-    }
-    attempts++;
+    if (a % 10 == 0) Serial.print(".");
+    a++;
   }
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    if (!wasEverConnected) wasEverConnected = true;
-    Serial.println("WiFi connected");
-    Serial.print("IP: ");
+    Serial.print("WiFi connected, IP: ");
     Serial.println(WiFi.localIP());
-  } else {
-    Serial.print("WiFi not connected. Status: ");
-    Serial.print(WiFi.status());
-    Serial.print(" (");
-    Serial.print(wifiStatusToString(WiFi.status()));
-    Serial.println(")");
+    return true;
   }
+
+  Serial.print("WiFi failed: ");
+  Serial.println(wifiStatusStr(WiFi.status()));
+  return false;
 }
 
-void uploadToThingSpeak(float temp, float humidity) {
+bool uploadToThingSpeak(float t, float h) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi not connected, skipping upload");
-    return;
+    return false;
   }
 
   HTTPClient http;
   String url = "http://api.thingspeak.com/update?api_key="
              + String(THINGSPEAK_API_KEY)
-             + "&field1=" + String(temp)
-             + "&field2=" + String(humidity);
+             + "&field1=" + String(t)
+             + "&field2=" + String(h);
 
   http.begin(url);
   int httpCode = http.GET();
@@ -90,23 +96,82 @@ void uploadToThingSpeak(float temp, float humidity) {
   if (httpCode > 0) {
     Serial.print("ThingSpeak upload OK, HTTP ");
     Serial.println(httpCode);
-  } else {
-    Serial.print("ThingSpeak upload failed, error: ");
-    Serial.println(http.errorToString(httpCode).c_str());
+    ledFlash(0, 5, 0, 50);
+    http.end();
+    return true;
   }
 
+  Serial.print("ThingSpeak upload failed, error: ");
+  Serial.println(http.errorToString(httpCode).c_str());
+  ledFlash(8, 0, 0, 50);
+  delay(120);
+  ledFlash(8, 0, 0, 50);
   http.end();
+  return false;
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== Climate Reader ===");
+
+  rgbLed.begin();
+  rgbLed.setBrightness(LED_BRIGHT);
+  ledOff();
+
+  uint8_t reason = esp_reset_reason();
+  Preferences prefs;
+  prefs.begin("climate", false);
+  uint32_t brownoutCount = prefs.getUInt("boc", 0);
+
+  if (reason == ESP_RST_BROWNOUT) {
+    brownoutCount++;
+    prefs.putUInt("boc", brownoutCount);
+
+    for (int i = 0; i < 3; i++) {
+      ledFlash(10, 0, 0, 40);
+      delay(120);
+    }
+
+    uint32_t cooldown = brownoutCount < 12 ? brownoutCount * 5u : 60u;
+    Serial.printf("BROWNOUT #%u detected — cooling %u s\n",
+                  brownoutCount, cooldown);
+    while (cooldown--) delay(1000);
+  } else {
+    brownoutCount = 0;
+    prefs.putUInt("boc", 0);
+  }
+
+  prefs.end();
+
+  Serial.printf("Boot — reset: %u  brownout tally: %u\n",
+                reason, brownoutCount);
+
+  WiFi.setTxPower(WIFI_POWER_17dBm);
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
   dht.begin();
   connectWiFi();
 }
 
 void loop() {
+  static uint32_t lastWiFiRetry = 0;
+
   if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
+    static uint32_t lastBlue = 0;
+    if (millis() - lastBlue > 3000) {
+      lastBlue = millis();
+      ledFlash(0, 0, 8, 50);
+    }
+
+    if (millis() - lastWiFiRetry > WIFI_RETRY_INTERVAL) {
+      lastWiFiRetry = millis();
+      Serial.println("WiFi down, reconnecting …");
+      connectWiFi();
+    }
+
+    delay(1000);
+    return;
   }
 
   float h = dht.readHumidity();
@@ -115,14 +180,9 @@ void loop() {
   if (isnan(h) || isnan(t)) {
     Serial.println("DHT11 read failed");
   } else {
-    Serial.print("Temp: ");
-    Serial.print(t);
-    Serial.print(" C  Humidity: ");
-    Serial.print(h);
-    Serial.println(" %");
-
+    Serial.printf("Temp: %.1f °C  Humidity: %.1f %%\n", t, h);
     uploadToThingSpeak(t, h);
   }
 
-  delay(60000);
+  delay(UPLOAD_INTERVAL);
 }
